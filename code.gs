@@ -3,9 +3,21 @@
  * Scans Gmail for job offers, logs them to a "Jobs" sheet, ages them
  * (NEW -> OLD -> OUTDATED), and tracks replies (interview / rejection).
  *
+ * An admin console (a "Settings" sheet tab, created automatically) controls
+ * what gets kept when a new posting is found: require a contact email,
+ * require a location, require a phone number, a distance cap for
+ * hybrid/onsite jobs, and a blacklist of phrases/keywords. These filters
+ * only affect NEW postings as they're found - they never delete or hide
+ * rows you've already captured.
+ *
  * SETUP: paste into Extensions > Apps Script in a Google Sheet, then
- *   1. Run setup()    (grants permissions, builds sheet, installs 15-min trigger)
- *   2. Run backfill() (one-time scan of the last 90 days)
+ *   1. Run setup()    (grants permissions, builds the Jobs and Settings
+ *                      sheets, installs the 15-min trigger)
+ *   2. Open the "Settings" tab and set your filters (all off by default)
+ *   3. Run backfill() (one-time scan of the last 90 days)
+ *
+ * Reopening the spreadsheet also adds a "Job Tracker" menu with shortcuts
+ * to the Settings tab, a manual scan, and a manual backfill.
  */
 
 const SHEET_NAME = 'Jobs';
@@ -31,6 +43,155 @@ const RE = {
   interview: /(schedule|set up|arrange)\s+(an?|your|the)?\s*(\w+\s+)?(interview|call|screen|chat)|invite you to (an? )?interview|like to (interview|speak with|meet with) you|phone screen|your availability|next round/i,
   phone: /(?<!\d)(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}(?!\d)/
 };
+
+/* ---------- admin console (Settings sheet) ---------- */
+
+const SETTINGS_SHEET_NAME = 'Settings';
+
+// [key, row label, value type]. Order = row order on the Settings sheet.
+// A label starting with two spaces is a sub-field of the checkbox above it.
+const SETTINGS_FIELDS = [
+  ['requireEmail',    'Omit rows that lack a contact email',             'checkbox'],
+  ['requireLocation', 'Omit rows that lack a location',                  'checkbox'],
+  ['requirePhone',    'Omit rows that lack a contact phone number',      'checkbox'],
+  ['limitDistance',   'Omit hybrid/onsite jobs over a certain distance', 'checkbox'],
+  ['homeZip',         '  ZIP code',                                     'text'],
+  ['maxMiles',        '  Distance in miles',                            'number'],
+  ['useBlacklist',    'Omit rows with blacklisted phrases/keywords',     'checkbox'],
+  ['blacklist',       '  Blacklisted phrases (comma separated)',        'text']
+];
+
+function getSettingsSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  if (sh) return sh;
+
+  sh = ss.insertSheet(SETTINGS_SHEET_NAME);
+  sh.getRange(1, 1, 1, 2).setValues([['Setting', 'Value']]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.setColumnWidth(1, 360);
+  sh.setColumnWidth(2, 280);
+
+  const rows = SETTINGS_FIELDS.map(f => [f[1], f[2] === 'checkbox' ? false : '']);
+  sh.getRange(2, 1, rows.length, 2).setValues(rows);
+
+  SETTINGS_FIELDS.forEach((f, i) => {
+    if (f[2] === 'checkbox') sh.getRange(i + 2, 2).insertCheckboxes();
+  });
+
+  const noteFor = (key, note) => {
+    const i = SETTINGS_FIELDS.findIndex(f => f[0] === key);
+    if (i !== -1) sh.getRange(i + 2, 2).setNote(note);
+  };
+  noteFor('homeZip', 'Only used when the distance checkbox above is on.');
+  noteFor('maxMiles', 'Only used when the distance checkbox above is on. Leave blank or 0 to disable the distance check even if the box is checked.');
+  noteFor('blacklist',
+    'Comma separated. A new job is skipped if its email contains any of these ' +
+    '(case-insensitive, matched anywhere in the subject or body). Example: ' +
+    'Sign up for, weekly, Save up to, Buy, unsubscribe, points');
+
+  return sh;
+}
+
+function getSettings_() {
+  const defaults = {
+    requireEmail: false,
+    requireLocation: false,
+    requirePhone: false,
+    limitDistance: false,
+    homeZip: '',
+    maxMiles: 0,
+    useBlacklist: false,
+    blacklist: []
+  };
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  if (!sh) return defaults;
+
+  const values = sh.getRange(2, 1, SETTINGS_FIELDS.length, 2).getValues();
+  const byLabel = {};
+  values.forEach(r => { byLabel[String(r[0]).trim()] = r[1]; });
+
+  const s = Object.assign({}, defaults);
+  SETTINGS_FIELDS.forEach(f => {
+    const key = f[0], label = f[1].trim(), type = f[2];
+    const raw = byLabel[label];
+    if (raw === undefined || raw === '') return;
+    if (type === 'checkbox') {
+      s[key] = raw === true || String(raw).toUpperCase() === 'TRUE';
+    } else if (type === 'number') {
+      const n = parseFloat(raw);
+      s[key] = isNaN(n) ? 0 : n;
+    } else if (key === 'blacklist') {
+      s[key] = String(raw).split(',').map(x => x.trim()).filter(Boolean);
+    } else {
+      s[key] = String(raw).trim();
+    }
+  });
+  return s;
+}
+
+function blank_(v) {
+  return !String(v || '').trim();
+}
+
+function normText_(s) {
+  return String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// Geocodes are cached for 6 hours (CacheService's max) so repeated ZIP
+// codes and repeated job locations don't re-hit the Maps service.
+function geocodeCached_(address) {
+  if (!address) return null;
+  const cache = CacheService.getScriptCache();
+  const key = 'geo_' + normText_(address).replace(/[^a-z0-9]/g, '_').slice(0, 200);
+  const hit = cache.get(key);
+  if (hit) return JSON.parse(hit);
+  try {
+    const res = Maps.newGeocoder().geocode(address);
+    if (!res || !res.results || !res.results.length) return null;
+    const loc = res.results[0].geometry.location;
+    cache.put(key, JSON.stringify(loc), 21600);
+    return loc;
+  } catch (e) {
+    return null;
+  }
+}
+
+function haversineMiles_(lat1, lng1, lat2, lng2) {
+  const R = 3958.8;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Returns a short reason string if the row should be skipped, or null to keep it.
+// Only called for brand new postings - it never touches rows already on the sheet.
+function shouldOmit_(row, text, settings, homeLoc) {
+  if (settings.requireEmail && blank_(row[C['Contact Email']])) return 'missing contact email';
+  if (settings.requireLocation && blank_(row[C['Location']])) return 'missing location';
+  if (settings.requirePhone && blank_(row[C['Contact Phone']])) return 'missing contact phone';
+
+  if (settings.useBlacklist && settings.blacklist.length) {
+    const hay = normText_(text);
+    const hit = settings.blacklist.find(k => k && hay.indexOf(normText_(k)) !== -1);
+    if (hit) return 'blacklisted phrase: ' + hit;
+  }
+
+  if (settings.limitDistance && settings.maxMiles > 0 && homeLoc) {
+    const mode = row[C['Work Mode']];
+    if ((mode === 'Hybrid' || mode === 'Onsite') && !blank_(row[C['Location']])) {
+      const jobLoc = geocodeCached_(row[C['Location']]);
+      if (jobLoc) {
+        const miles = haversineMiles_(homeLoc.lat, homeLoc.lng, jobLoc.lat, jobLoc.lng);
+        if (miles > settings.maxMiles) return 'too far: ' + Math.round(miles) + ' mi (limit ' + settings.maxMiles + ')';
+      }
+    }
+  }
+  return null;
+}
 
 /* ---------- entry points ---------- */
 
@@ -58,10 +219,26 @@ function setup() {
     rule('=$A2="NEW"', '#d9ead3', null, false)
   ]);
 
+  getSettingsSheet_();
+
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'run')
     .forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('run').timeBased().everyMinutes(15).create();
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Job Tracker')
+    .addItem('Open settings', 'openSettings')
+    .addItem('Scan now', 'run')
+    .addItem('Backfill last 90 days', 'backfill')
+    .addToUi();
+}
+
+function openSettings() {
+  const sh = getSettingsSheet_();
+  SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(sh);
 }
 
 function backfill() {
@@ -79,6 +256,8 @@ function run() {
 function processMailbox_(days) {
   const sh = getSheet_();
   const rows = readRows_(sh);
+  const settings = getSettings_();
+  const homeLoc = (settings.limitDistance && settings.homeZip) ? geocodeCached_(settings.homeZip) : null;
 
   const seen = new Set();
   rows.forEach(r => String(r[C['Message IDs']]).split(',').forEach(id => id && seen.add(id)));
@@ -97,11 +276,12 @@ function processMailbox_(days) {
   }
 
   msgs.sort((a, b) => a.getDate() - b.getDate()); // oldest first so later replies win
-  msgs.forEach(m => handleMessage_(rows, m));
+  msgs.forEach(m => handleMessage_(rows, m, settings, homeLoc));
   writeRows_(sh, rows);
 }
 
-function handleMessage_(rows, m) {
+function handleMessage_(rows, m, settings, homeLoc) {
+  settings = settings || getSettings_();
   const subject = m.getSubject() || '';
   const body = m.getPlainBody() || '';
   const text = subject + '\n' + body;
@@ -131,6 +311,11 @@ function handleMessage_(rows, m) {
   // 3) New posting (or an untracked response worth logging)
   if (isPosting_(text) || sig) {
     const row = buildRow_(m, subject, body, text, sender, threadId);
+    const reason = shouldOmit_(row, text, settings, homeLoc);
+    if (reason) {
+      Logger.log('Skipped (' + reason + '): ' + subject);
+      return;
+    }
     rows.push(row);
     if (sig) applySignal_(row, sig, m);
   }
