@@ -33,7 +33,7 @@ Every posting starts at 40 and gains or loses points against your targets:
 
 - Full-time employment: +30. Contract: +15 if 12+ months stated.
 - Remote: +20. Hybrid: +5.
-- Compensation at/above $180k/yr (hourly annualized at 2,080 hrs): +25;
+- Compensation at/above $200k/yr (hourly annualized at 2,080 hrs): +25;
   $150k+: +10.
 - Each specialty hit (key management, information security, AI, TMS,
   project management): +5, up to 5 hits.
