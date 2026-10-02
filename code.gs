@@ -16,7 +16,7 @@
  *  - Scores every posting 0-100 ("Score" column) against your targets and
  *    marks high scorers IMPORTANT in the Priority column:
  *      * full-time employment preferred; contracts need 12+ months
- *      * remote preferred; $180k+/yr target
+ *      * remote preferred; $200k+/yr target
  *      * specialties: key management, information security, AI,
  *        TMS, project management
  *  - Filters out non-serious leads: educational/training pitches, part-time
@@ -64,7 +64,7 @@ const OUTDATED_AFTER_DAYS = 90;
 const ACTIVE_STAGES = ['INTERVIEW REQUEST'];
 
 // ---- prioritization targets (tune to taste) ----
-const TARGET_ANNUAL_SALARY = 180000; // $/yr full-time-equivalent target
+const TARGET_ANNUAL_SALARY = 200000; // $/yr full-time-equivalent target
 const MIN_CONTRACT_MONTHS = 12;      // contracts must run at least this long
 const BASE_SCORE = 40;               // every posting starts here (0-100 scale)
 const IMPORTANT_AT = 75;             // score at/above this -> Priority IMPORTANT
@@ -325,7 +325,7 @@ function extractContractMonths_(text) {
 }
 
 // 0-100 fit score for a posting against your targets. Higher = closer to
-// full-time, remote, $180k+, and your specialty areas.
+// full-time, remote, $200k+, and your specialty areas.
 function scorePosting_(row, text) {
   let score = BASE_SCORE;
   const type = row[C['Type']];
